@@ -7,7 +7,7 @@ Your bookmarks stay on your machine. No account required. Free and open source.
 ## Install
 
 ```bash
-npm install -g ft-bookmarks
+npm install -g fieldtheory
 ```
 
 Requires Node.js 20+.
@@ -27,7 +27,7 @@ ft categories
 ft stats
 ```
 
-On first run, `ft sync` extracts your X session from Chrome and downloads your bookmarks into `~/.ft-bookmarks/`. It auto-classifies them into 7 categories (tool, security, technique, launch, research, opinion, commerce) using fast regex matching.
+On first run, `ft sync` extracts your X session from Chrome and downloads your bookmarks into `~/.fieldtheory/`. It auto-classifies them into 7 categories (tool, security, technique, launch, research, opinion, commerce) using fast regex matching.
 
 ## Commands
 
@@ -88,10 +88,10 @@ ft sync --api    # uses API token, works headlessly
 
 ## Data
 
-All data is stored locally at `~/.ft-bookmarks/`:
+All data is stored locally at `~/.fieldtheory/`:
 
 ```
-~/.ft-bookmarks/
+~/.fieldtheory/
   bookmarks.jsonl         # raw bookmark cache (one per line)
   bookmarks.db            # SQLite FTS5 search index
   bookmarks-meta.json     # sync metadata
