@@ -4,7 +4,7 @@
   "description": "Field Theory CLI. Self-custody for your X/Twitter bookmarks. Local sync, full-text search, classification, and terminal dashboards.",
   "type": "module",
   "bin": {
-    "ft": "./bin/ft.mjs"
+    "ft": "bin/ft.mjs"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -25,7 +25,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/afar1/fieldtheory-cli"
+    "url": "git+https://github.com/afar1/fieldtheory-cli.git"
   },
   "keywords": [
     "bookmarks",

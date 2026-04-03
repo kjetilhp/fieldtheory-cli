@@ -88,14 +88,14 @@ ft sync --api    # uses API token, works headlessly
 
 ## Data
 
-All data is stored locally at `~/.fieldtheory/`:
+All data is stored locally at `~/.ft-bookmarks/`:
 
 ```
-~/.fieldtheory/
+~/.ft-bookmarks/
   bookmarks.jsonl         # raw bookmark cache (one per line)
   bookmarks.db            # SQLite FTS5 search index
   bookmarks-meta.json     # sync metadata
-  oauth-token.json        # OAuth token (if using API mode)
+  oauth-token.json        # OAuth token (if using API mode, chmod 600)
 ```
 
 Override the location with `FT_DATA_DIR`:
@@ -127,6 +127,16 @@ Use `ft classify --deep` for LLM-powered classification that catches what regex 
 | Search, list, classify, viz | Yes | Yes | Yes |
 
 \*Chrome session extraction uses macOS Keychain. On other platforms, use `ft auth` + `ft sync --api`.
+
+## Security
+
+**Your data stays local.** The CLI makes no network requests except to X's API during sync. No telemetry, no analytics, nothing phoned home.
+
+**Chrome session sync (`ft sync`)** reads cookies from Chrome's local database to authenticate with X. This uses the same mechanism as browser extensions. Your cookies are never stored separately — they're read, used for the sync request, and discarded. This requires Chrome to be installed and logged into X.
+
+**OAuth tokens** are stored at `~/.ft-bookmarks/oauth-token.json` with `chmod 600` (owner-only read/write). If you use API mode, treat this file like a password.
+
+**The default sync method uses X's internal GraphQL API**, the same API that x.com uses in your browser. If you prefer to use the official v2 API with your own keys, use `ft auth` + `ft sync --api`.
 
 ## License
 
