@@ -120,7 +120,7 @@ async function checkForUpdate(): Promise<void> {
 // ── What's new ────────────────────────────────────────────────────────────
 
 const WHATS_NEW: Record<string, string[]> = {
-  '1.3.0': [
+  '1.2.2': [
     'ft sync --gaps \u2014 backfill missing quoted tweets and expand truncated articles',
     'Quoted tweet content and full article text now captured automatically during sync',
     'Bookmark date (when you bookmarked, not just when it was posted) now tracked',
@@ -336,7 +336,7 @@ export function buildCli() {
   program
     .name('ft')
     .description('Self-custody for your X/Twitter bookmarks. Sync, search, classify, and explore locally.')
-    .version('1.2.1')
+    .version('1.2.2')
     .showHelpAfterError()
     .hook('preAction', () => {
       console.log(logo());
