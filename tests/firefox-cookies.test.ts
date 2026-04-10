@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createDb, saveDb } from '../src/db.js';
-import { extractFirefoxXCookies } from '../src/firefox-cookies.js';
+import { extractFirefoxXCookies, ensureFirefoxCookieBackendAvailable } from '../src/firefox-cookies.js';
 
 async function createFirefoxProfile(cookies: Array<{ host: string; name: string; value: string }>): Promise<string> {
   const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-firefox-profile-'));
@@ -74,4 +74,17 @@ test('extractFirefoxXCookies falls back to twitter.com cookies when x.com is abs
   } finally {
     fs.rmSync(profileDir, { recursive: true, force: true });
   }
+});
+
+test('ensureFirefoxCookieBackendAvailable: rejects unsupported Windows runtime clearly', () => {
+  assert.throws(
+    () => ensureFirefoxCookieBackendAvailable('win32', false, false),
+    /Firefox on Windows requires Node\.js 22\.5\+ or sqlite3 on PATH/,
+  );
+});
+
+test('ensureFirefoxCookieBackendAvailable: allows Windows when a supported backend exists', () => {
+  assert.doesNotThrow(() => ensureFirefoxCookieBackendAvailable('win32', true, false));
+  assert.doesNotThrow(() => ensureFirefoxCookieBackendAvailable('win32', false, true));
+  assert.doesNotThrow(() => ensureFirefoxCookieBackendAvailable('linux', false, false));
 });

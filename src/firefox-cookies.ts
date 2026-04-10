@@ -20,6 +20,47 @@ interface NodeSqliteModule {
 }
 
 let nodeSqliteModule: NodeSqliteModule | null | undefined;
+let sqlite3BinaryAvailable: boolean | undefined;
+
+const FIREFOX_WINDOWS_BACKEND_REQUIREMENT =
+  'Firefox on Windows requires Node.js 22.5+ or sqlite3 on PATH.';
+
+function hasSqlite3Binary(): boolean {
+  if (sqlite3BinaryAvailable !== undefined) return sqlite3BinaryAvailable;
+  try {
+    execFileSync('sqlite3', ['-version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+    });
+    sqlite3BinaryAvailable = true;
+  } catch {
+    sqlite3BinaryAvailable = false;
+  }
+  return sqlite3BinaryAvailable;
+}
+
+export function ensureFirefoxCookieBackendAvailable(
+  os: string = platform(),
+  hasNodeSqlite?: boolean,
+  hasSqlite3?: boolean,
+): void {
+  if (os !== 'win32') return;
+
+  const nodeSqliteAvailable = hasNodeSqlite ?? loadNodeSqlite() !== null;
+  if (nodeSqliteAvailable) return;
+
+  const sqlite3Available = hasSqlite3 ?? hasSqlite3Binary();
+  if (sqlite3Available) return;
+
+  throw new Error(
+    `${FIREFOX_WINDOWS_BACKEND_REQUIREMENT}\n` +
+    'Fix:\n' +
+    '  1. Upgrade to Node.js 22.5+ (recommended), or\n' +
+    '  2. Install sqlite3 and make sure it is on PATH, or\n' +
+    '  3. Pass cookies manually:  ft sync --cookies <ct0> <auth_token>'
+  );
+}
 
 // ── Profile detection ────────────────────────────────────────────────────────
 
@@ -202,6 +243,7 @@ function queryFirefoxCookies(
 export function extractFirefoxXCookies(profileDir?: string): ChromeCookieResult {
   const dir = profileDir ?? detectFirefoxProfileDir();
   const dbPath = join(dir, 'cookies.sqlite');
+  ensureFirefoxCookieBackendAvailable();
 
   let cookies = queryFirefoxCookies(dbPath, '.x.com', ['ct0', 'auth_token']);
   if (cookies.length === 0) {
