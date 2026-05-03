@@ -26,11 +26,24 @@ describe('skill content', () => {
       assert.ok(content.includes('ft list'));
       assert.ok(content.includes('ft stats'));
       assert.ok(content.includes('ft show'));
+      assert.ok(content.includes('ft seeds search'));
+      assert.ok(content.includes('ft possible run'));
+      assert.ok(content.includes('ft possible grid'));
+      assert.ok(content.includes('ft possible prompt'));
+      assert.ok(content.includes('ft possible nightly install'));
       assert.ok(content.includes('ft library search'));
       assert.ok(content.includes('ft library show'));
       assert.ok(content.includes('ft commands list'));
       assert.ok(content.includes('ft commands validate'));
     }
+  });
+
+  it('skill teaches natural-language roadmap requests', () => {
+    const content = skillWithFrontmatter();
+    assert.ok(content.includes('XYZ type of bookmarks'));
+    assert.ok(content.includes('roadmap plotted in the grid'));
+    assert.ok(content.includes('these projects'));
+    assert.ok(content.includes('generate -> critique -> score'));
   });
 
   it('skill content ends with newline', () => {

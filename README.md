@@ -84,6 +84,18 @@ On first run, `ft sync` extracts your X session from your browser and downloads 
 | `ft lint` | Health-check the wiki for broken links and missing pages |
 | `ft lint --fix` | Auto-fix fixable wiki issues |
 
+### Possibility runs
+
+| Command | Description |
+|---------|-------------|
+| `ft seeds search "<query>" --create` | Save a bookmark-grounded seed |
+| `ft repos add <path>` | Add a repo to the default repo set |
+| `ft possible` | Interactive seed + repo + frame wizard |
+| `ft possible run --defaults` | Re-run with the most-recently-used seed and saved repos |
+| `ft possible run --background` | Start a run as a background job |
+| `ft possible prompt <node-id>` | Print the goal prompt for one plotted node |
+| `ft possible nightly install` | Install a nightly Possible run on macOS |
+
 ### Field Theory app companion
 
 | Command | Description |
@@ -144,11 +156,15 @@ Then ask your agent:
 
 > "I bookmarked a number of new open source AI memory tools. Pick the best one and figure out how to incorporate it in this repo."
 
+> "Your goal is to look at AI agent bookmarks and come up with a roadmap plotted in the grid of what I should do next across the Field Theory CLI and Mac app projects."
+
 > "Every day please sync any new X bookmarks using the Field Theory CLI."
 
 Works with Claude Code, Codex, or any agent with shell access.
 
 ## Scheduling
+
+Sync with cron:
 
 ```bash
 # Sync every morning at 7am
@@ -157,6 +173,19 @@ Works with Claude Code, Codex, or any agent with shell access.
 # Sync and classify every morning
 0 7 * * * ft sync --classify
 ```
+
+Run Possible every night on macOS with LaunchAgent:
+
+```bash
+ft seeds search "agents" --days 90 --limit 8 --frame leverage-specificity --create
+ft repos add ~/dev/fieldtheory
+ft repos add ~/dev/fieldtheory-cli
+
+ft possible nightly install --time 02:00 --defaults --model opus --effort medium --nodes 5
+ft possible nightly show
+```
+
+Nightly schedules are stored under `~/.fieldtheory/ideas/nightly/`. Each tick starts a normal background job under `~/.fieldtheory/ideas/jobs/`, using your local logged-in CLI sessions and the current `PATH` captured in the LaunchAgent plist.
 
 `ft` respects standard proxy environment variables for network requests: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 
@@ -176,6 +205,10 @@ Data is stored locally under `~/.fieldtheory/`:
 
 ~/.fieldtheory/commands/
   *.md                    # portable commands used by Field Theory and agents
+
+~/.fieldtheory/ideas/
+  seeds/runs/nodes/       # Possible seeds, runs, and node prompt artifacts
+  batches/jobs/nightly/   # Multi-repo batches, background jobs, and schedules
 ```
 
 Override locations with `FT_DATA_DIR`, `FT_LIBRARY_DIR`, and `FT_COMMANDS_DIR`:

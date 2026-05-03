@@ -33,11 +33,85 @@ import { exportBookmarks } from './md-export.js';
 import { renderViz } from './bookmarks-viz.js';
 import { listBrowserIds } from './browsers.js';
 import { configureHttpProxyFromEnv } from './http-proxy.js';
-import { dataDir, ensureDataDir, isFirstRun, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
 import { PromptCancelledError, promptText } from './prompt.js';
 import { skillWithFrontmatter, installSkill, uninstallSkill } from './skill.js';
 import { registerCompanionCommands } from './companion-cli.js';
 import { getPathReport } from './field-status.js';
+import {
+  formatIdeasIntro,
+  formatRunList,
+  formatRunSummary,
+  getIdeaPrompt,
+  listIdeaRuns,
+  renderRunDots,
+  renderRunGrid,
+  runIdeas,
+  resolveIdeaRun,
+  resolveFrameIdForRun,
+} from './ideas.js';
+import {
+  createIdeasSeedFromArtifacts,
+  createIdeasSeedFromText,
+  deleteIdeasSeed,
+  formatIdeasSeed,
+  formatIdeasSeedList,
+  listIdeasSeeds,
+  pickMostRecentlyUsedSeed,
+  readIdeasSeed,
+} from './ideas-seeds.js';
+import {
+  addRepoToRegistry,
+  clearReposRegistry,
+  listSavedRepos,
+  removeRepoFromRegistry,
+  resolveRepoList,
+} from './ideas-repos.js';
+import { runPossibleWizard } from './possible-wizard.js';
+import {
+  formatIdeasJob,
+  formatIdeasJobList,
+  listIdeasJobs,
+  readIdeasJob,
+  runIdeasJobWorker,
+  startIdeasBackgroundJob,
+} from './ideas-jobs.js';
+import {
+  createIdeasNightlySchedule,
+  currentCliInvocation,
+  deleteIdeasNightlySchedule,
+  formatIdeasNightlySchedule,
+  formatIdeasNightlyScheduleList,
+  listIdeasNightlySchedules,
+  loadNightlyLaunchAgent,
+  readIdeasNightlySchedule,
+  runIdeasNightlyTick,
+  unloadNightlyLaunchAgent,
+  validateNightlyTime,
+  writeNightlyLaunchAgent,
+  type IdeasNightlyPlan,
+} from './ideas-nightly.js';
+import { DEFAULT_FRAMES } from './adjacent/frames.js';
+import { validateNodeTarget } from './adjacent/prompts.js';
+import {
+  addUserFrameFromFile,
+  getFrame,
+  listAllFrames,
+  loadUserFrames,
+  removeUserFrame,
+  validateOptionalFrameId,
+} from './frames-registry.js';
+import {
+  SEED_STRATEGIES,
+  buildSeedStrategySpec,
+  generateRandomSeedPrompts,
+  getSeedStrategy,
+  summarizeSeedIntent,
+} from './seeds-strategies.js';
+import { formatSeedCandidates, queryRandomSeedCandidates, querySeedCandidates } from './seeds-query.js';
+import { formatSeedOrganization, organizeSeedCandidatesBy } from './seeds-organize.js';
+import { modelOrganizeSeeds } from './seeds-model.js';
+import { saveSeedFromCandidates } from './seeds-save.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -342,6 +416,18 @@ function logo(): string {
      \x1b[2m\u2514${'\u2500'.repeat(innerW)}\u2518\x1b[0m`;
 }
 
+function isInternalWorkerCommand(command: Command): boolean {
+  return command.name() === '_run-job';
+}
+
+function shouldSkipCommandChrome(command: Command): boolean {
+  if (isInternalWorkerCommand(command)) return true;
+  if (command.opts().json) return true;
+  if (command.name() === 'path' || command.name() === 'paths') return true;
+  if (command.name() === 'show' && command.parent?.name() === 'skill') return true;
+  return false;
+}
+
 export function showWelcome(): void {
   console.log(logo());
   console.log(`
@@ -510,6 +596,43 @@ export function resolveFolder(folders: BookmarkFolder[], query: string): Bookmar
   throw new Error(`No folder matches "${query}". Available: ${available}`);
 }
 
+/**
+ * Format and print the human-facing summary of an `ft ideas run` invocation.
+ * Single-repo and multi-repo runs share most of the output but diverge on the
+ * "complete" header, the per-line repo tag, and the "next steps" suggestions.
+ */
+function printIdeasRunReport(summary: import('./ideas.js').IdeasRunSummary): void {
+  const isBatch = summary.runIds.length > 1;
+  if (isBatch) {
+    console.log(`\n  ✓ Ideas batch complete: ${summary.batchId}`);
+    console.log(`  Runs: ${summary.runIds.length} (one per repo)`);
+  } else {
+    console.log(`\n  ✓ Ideas run complete: ${summary.runIds[0]}`);
+  }
+  console.log(`  Frame: ${summary.frameName}`);
+  console.log(`  Model: ${summary.model}`);
+  if (summary.nodeTarget) console.log(`  Nodes requested per repo: ${summary.nodeTarget}`);
+  console.log(`  Ideas generated: ${summary.dotCount}`);
+
+  if (summary.topDots.length > 0) {
+    console.log(`\n  Top ideas${isBatch ? ' across all repos' : ''}:`);
+    for (const dot of summary.topDots) {
+      const repoTag = isBatch ? `  (${path.basename(dot.repo)})` : '';
+      console.log(`    - ${dot.title}  [A:${dot.axisAScore} B:${dot.axisBScore}]${repoTag}`);
+    }
+  }
+
+  console.log(`\n  Next:`);
+  if (isBatch) {
+    for (const runId of summary.runIds) {
+      console.log(`    ft ideas grid ${runId}`);
+    }
+  } else {
+    console.log(`    ft ideas grid ${summary.runIds[0]}`);
+    console.log(`    ft ideas dots ${summary.runIds[0]}`);
+  }
+}
+
 /** Per-invocation LLM engine override (bypasses saved default, fails fast). */
 export function engineOption(): Option {
   return new Option('--engine <name>', 'Override the LLM engine for this run (e.g. claude, codex)');
@@ -536,6 +659,20 @@ function safe(fn: (...args: any[]) => Promise<void>): (...args: any[]) => Promis
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 export function buildCli() {
+  // One-time migration of ideas data from ~/.ft-bookmarks/automation/{ideas,adjacent}/
+  // to ~/.fieldtheory/ideas/. Idempotent and cheap on hot paths — two fs.existsSync
+  // calls after the first run. Runs before any command so every subcommand sees
+  // the new layout.
+  try {
+    const migration = migrateLegacyIdeasData();
+    if (migration.migrated) {
+      process.stderr.write(`  Migrated ideas data → ${migration.newRoot}\n`);
+      process.stderr.write(`  Legacy copies left intact at ${migration.legacyIdeasRoot} and ${migration.legacyAdjacentRoot}.\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`  Warning: ideas data migration failed — ${(err as Error).message}\n`);
+  }
+
   const program = new Command();
 
   async function rebuildIndex(): Promise<number> {
@@ -582,7 +719,12 @@ export function buildCli() {
     .name('ft')
     .description('Self-custody for your X/Twitter bookmarks. Sync, search, classify, and explore locally.')
     .version(getLocalVersion())
-    .showHelpAfterError();
+    .showHelpAfterError()
+    .hook('preAction', (_thisCommand, actionCommand) => {
+      if (shouldSkipCommandChrome(actionCommand)) return;
+      console.log(logo());
+      showWhatsNew();
+    });
 
   // ── sync ────────────────────────────────────────────────────────────────
 
@@ -1541,6 +1683,1094 @@ export function buildCli() {
       }
     }));
 
+  // ── possible ───────────────────────────────────────────────────────────
+  //
+  // User-facing surface for the "apply a bookmark group to a repo → scored
+  // ideas on a 2x2 grid" feature. Previously named `ft ideas`; the old name
+  // still works as an alias. Internal module names, types, and on-disk md
+  // frontmatter types remain `ideas*` on purpose — renaming them would
+  // require a second migration and the mac app will eventually consume
+  // those shapes.
+
+  const possible = program
+    .command('possible')
+    .alias('ideas')
+    .description('Apply a bookmark group to one or more repos — produces scored ideas on a 2x2 grid');
+
+  // Bare `ft possible` runs the interactive wizard when stdin is a TTY, and
+  // falls back to the help intro when it is not (pipes, CI, test harness).
+  possible
+    .action(safe(async () => {
+      if (!process.stdin.isTTY) {
+        console.log(formatIdeasIntro());
+        return;
+      }
+      const wizardResult = await runPossibleWizard(
+        {
+          ask: async (question) => {
+            const result = await promptText(question);
+            if (result.kind === 'interrupt') {
+              throw new PromptCancelledError('Cancelled.', 130);
+            }
+            if (result.kind === 'close') {
+              throw new PromptCancelledError('No answer.', 0);
+            }
+            return result.value;
+          },
+          write: (line) => process.stderr.write(`${line}\n`),
+        },
+        {
+          listSeeds: () => listIdeasSeeds(),
+          listRepos: () => listSavedRepos(),
+          listFrames: () => listAllFrames(),
+        },
+      );
+
+      if (wizardResult.kind === 'cancelled') {
+        process.stderr.write(`\n  Wizard cancelled (${wizardResult.reason}).\n`);
+        return;
+      }
+      if (wizardResult.kind === 'no-seeds') {
+        // stepPickSeed already printed the command hint.
+        return;
+      }
+
+      const { plan } = wizardResult;
+      process.stderr.write('\n  Launching...\n');
+      const summary = await runIdeas({
+        seedId: plan.seedId,
+        repos: plan.repos,
+        frameId: plan.frameId,
+        depth: plan.depth,
+        engine: plan.engine,
+        model: plan.model,
+        effort: plan.effort,
+        nodeTarget: plan.nodeTarget,
+        onProgress: (message) => {
+          process.stderr.write(`  ${message}\n`);
+        },
+      });
+      printIdeasRunReport(summary);
+    }));
+
+  possible
+    .command('explain')
+    .description('Explain what `ft possible` does and what to expect during a run')
+    .action(() => {
+      console.log(formatIdeasIntro());
+    });
+
+  possible
+    .command('run')
+    .description('Run a possibility exploration from a seed or seed artifact group, against one or more repos')
+    .option('--seed-artifact <id...>', 'One or more seed artifact ids to start from')
+    .option('--seed <id>', 'Saved seed id to start from')
+    .option('--repo <path>', 'Single repo path to explore against (shorthand for --repos with one path)')
+    .option('--repos <path...>', 'Multiple repo paths; produces one consideration per repo plus a batch summary')
+    .option('--frame <id>', 'Frame id (overrides any frame pinned on the seed)')
+    .option('--depth <depth>', 'Depth: quick | standard | deep (default: standard, or quick under --defaults)')
+    .option('--engine <name>', 'LLM CLI engine for this run (claude | codex; default comes from ft model/autodetect)')
+    .option('--model <name>', 'Model alias/name passed to the engine (for example opus or gpt-5.5)')
+    .option('--effort <level>', 'Reasoning effort passed to the engine (low | medium | high | xhigh | max)')
+    .option('--weight <level>', 'Alias for --effort', undefined)
+    .option('--nodes <n>', 'Number of nodes/debates to generate per repo (default comes from --depth)')
+    .option('--steering <text>', 'Optional steering nudge')
+    .option('--background', 'Launch in the background and return immediately', false)
+    .option('--defaults', 'Re-run with sensible defaults: most-recently-used seed, saved repo registry, seed-pinned frame, quick depth', false)
+    .action(safe(async (options) => {
+      // ── --defaults: fill in the blanks from the store ────────────────
+      // Commander no longer sets a default on --depth, so options.depth is
+      // undefined when the user did not pass --depth. That lets the
+      // --defaults branch distinguish "user asked for standard" from
+      // "user asked for nothing" and only rewrite the latter.
+      let seedArtifactIds = Array.isArray(options.seedArtifact)
+        ? (options.seedArtifact as string[]).map(String)
+        : options.seedArtifact ? [String(options.seedArtifact)] : undefined;
+      let seedId = options.seed ? String(options.seed) : undefined;
+      const depthExplicit = options.depth !== undefined;
+      let depth: 'quick' | 'standard' | 'deep' = (options.depth as 'quick' | 'standard' | 'deep' | undefined) ?? 'standard';
+      const nodeTarget = validateNodeTarget(options.nodes);
+      const effort = options.effort ? String(options.effort).trim() : undefined;
+      const weight = options.weight ? String(options.weight).trim() : undefined;
+
+      if (effort && weight && effort !== weight) {
+        console.log('  Use either --effort or --weight for the same run, not both with different values.');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (options.defaults) {
+        if (!seedId && (!seedArtifactIds || seedArtifactIds.length === 0)) {
+          const mostRecent = pickMostRecentlyUsedSeed(listIdeasSeeds());
+          if (!mostRecent) {
+            console.log('  No saved seeds to default to. Create one with `ft seeds search "..." --create`.');
+            process.exitCode = 1;
+            return;
+          }
+          seedId = mostRecent.id;
+          console.log(`  Using most recently used seed: ${mostRecent.id}  ${mostRecent.title}`);
+        }
+        if (!depthExplicit) {
+          // Only override when the user did NOT pass --depth. This way
+          // `ft possible run --defaults --depth standard` stays standard
+          // instead of being silently rewritten to quick.
+          depth = 'quick';
+        }
+      }
+
+      if ((!seedArtifactIds || seedArtifactIds.length === 0) && !seedId) {
+        console.log('  Provide either --seed-artifact <id...> or --seed <seed-id>. (Or --defaults to auto-pick.)');
+        process.exitCode = 1;
+        return;
+      }
+
+      const resolution = resolveRepoList({
+        singleRepo: options.repo ? String(options.repo) : undefined,
+        multiRepos: Array.isArray(options.repos) ? (options.repos as string[]).map(String) : undefined,
+        savedRepos: listSavedRepos(),
+      });
+      if (resolution.kind === 'error') {
+        if (resolution.reason === 'both-flags') {
+          console.log('  Use either --repo or --repos, not both.');
+        } else {
+          console.log('  No repo specified and no saved repos found.');
+          console.log('  Pass --repo <path> or --repos <path...>, or save defaults with `ft repos add <path>`.');
+        }
+        process.exitCode = 1;
+        return;
+      }
+      const repos = resolution.repos;
+      const explicitFrameId = validateOptionalFrameId(options.frame);
+      const seedFrameId = seedId ? readIdeasSeed(seedId)?.frameId : undefined;
+      const frameId = validateOptionalFrameId(resolveFrameIdForRun(explicitFrameId, seedFrameId))!;
+
+      const plan = {
+        seedArtifactIds,
+        seedId,
+        repos,
+        frameId,
+        depth,
+        engine: options.engine ? String(options.engine).trim() : undefined,
+        model: options.model ? String(options.model).trim() : undefined,
+        effort: effort || weight,
+        nodeTarget,
+        steering: options.steering ? String(options.steering) : undefined,
+      };
+
+      if (options.background) {
+        const job = startIdeasBackgroundJob(plan);
+        console.log(`  ✓ Background job started: ${job.id}`);
+        console.log(`  pid: ${job.pid}`);
+        console.log(`  log: ${job.logPath}`);
+        console.log(`\n  Inspect: ft possible job ${job.id}`);
+        return;
+      }
+
+      console.log('  Runs on your local machine. Keep your laptop awake for longer debates.');
+      if (repos.length > 1) {
+        console.log(`  Batched run across ${repos.length} repos. The seed brief is computed once and reused.`);
+      }
+
+      const summary = await runIdeas({
+        ...plan,
+        onProgress: (message) => {
+          process.stderr.write(`  ${message}\n`);
+        },
+      });
+
+      printIdeasRunReport(summary);
+    }));
+
+  possible
+    .command('jobs')
+    .description('List background possibility jobs')
+    .action(safe(async () => {
+      console.log(formatIdeasJobList(listIdeasJobs()));
+    }));
+
+  possible
+    .command('job')
+    .description('Show one background possibility job')
+    .argument('<jobId>', 'Background job id')
+    .option('--json', 'Output JSON instead of text', false)
+    .option('--log', 'Include recent log output', false)
+    .option('--tail <n>', 'Number of log lines with --log', (v: string) => Number(v), 20)
+    .action(safe(async (jobId: string, options) => {
+      const job = readIdeasJob(String(jobId));
+      if (!job) {
+        console.log(`  Job not found: ${String(jobId)}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (options.json) {
+        console.log(JSON.stringify(job, null, 2));
+        return;
+      }
+      console.log(formatIdeasJob(job, { includeLog: Boolean(options.log), logLines: Number(options.tail) || 20 }));
+    }));
+
+  const nightly = possible
+    .command('nightly')
+    .description('Install and manage a nightly Possible run that starts background jobs');
+
+  nightly
+    .action(() => {
+      console.log(formatIdeasNightlyScheduleList(listIdeasNightlySchedules()));
+      console.log('');
+      console.log('Install one with: ft possible nightly install --time 02:00 --defaults');
+    });
+
+  nightly
+    .command('install')
+    .description('Save a nightly run shape and install a macOS LaunchAgent when available')
+    .option('--id <id>', 'Schedule id (default: default)')
+    .option('--time <HH:MM>', 'Local 24-hour time to run every night', '02:00')
+    .option('--seed-artifact <id...>', 'One or more seed artifact ids to start from')
+    .option('--seed <id>', 'Saved seed id to start from')
+    .option('--repo <path>', 'Single repo path to explore against')
+    .option('--repos <path...>', 'Multiple repo paths')
+    .option('--frame <id>', 'Frame id (defaults to seed-pinned frame or leverage-specificity)')
+    .option('--depth <depth>', 'Depth: quick | standard | deep', 'quick')
+    .option('--engine <name>', 'LLM CLI engine for this run (claude | codex)')
+    .option('--model <name>', 'Model alias/name passed to the engine')
+    .option('--effort <level>', 'Reasoning effort passed to the engine')
+    .option('--weight <level>', 'Alias for --effort', undefined)
+    .option('--nodes <n>', 'Number of nodes/debates to generate per repo')
+    .option('--steering <text>', 'Optional steering nudge')
+    .option('--defaults', 'Resolve the seed and saved repo registry each night', true)
+    .option('--no-defaults', 'Require explicit seed and repo choices instead of resolving them each night')
+    .option('--no-launchd', 'Only save the schedule; do not write a macOS LaunchAgent')
+    .option('--no-load', 'Write the LaunchAgent plist but do not load it with launchctl')
+    .action(safe(async (options) => {
+      const seedArtifactIds = Array.isArray(options.seedArtifact)
+        ? (options.seedArtifact as string[]).map(String)
+        : options.seedArtifact ? [String(options.seedArtifact)] : undefined;
+      const seedId = options.seed ? String(options.seed) : undefined;
+      const defaults = options.defaults !== false;
+      const depth = String(options.depth || 'quick') as 'quick' | 'standard' | 'deep';
+      if (!['quick', 'standard', 'deep'].includes(depth)) {
+        console.log('  Depth must be quick, standard, or deep.');
+        process.exitCode = 1;
+        return;
+      }
+      const effort = options.effort ? String(options.effort).trim() : undefined;
+      const weight = options.weight ? String(options.weight).trim() : undefined;
+      if (effort && weight && effort !== weight) {
+        console.log('  Use either --effort or --weight for the same schedule, not both with different values.');
+        process.exitCode = 1;
+        return;
+      }
+
+      const repoResolution = resolveRepoList({
+        singleRepo: options.repo ? String(options.repo) : undefined,
+        multiRepos: Array.isArray(options.repos) ? (options.repos as string[]).map(String) : undefined,
+        savedRepos: [],
+      });
+      if (repoResolution.kind === 'error' && repoResolution.reason === 'both-flags') {
+        console.log('  Use either --repo or --repos, not both.');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (!defaults && !seedId && (!seedArtifactIds || seedArtifactIds.length === 0)) {
+        console.log('  --no-defaults requires --seed or --seed-artifact.');
+        process.exitCode = 1;
+        return;
+      }
+      if (!defaults && repoResolution.kind !== 'ok') {
+        console.log('  --no-defaults requires --repo or --repos.');
+        process.exitCode = 1;
+        return;
+      }
+
+      const plan: IdeasNightlyPlan = {
+        defaults,
+        seedArtifactIds,
+        seedId,
+        repos: repoResolution.kind === 'ok' ? repoResolution.repos : undefined,
+        frameId: validateOptionalFrameId(options.frame),
+        depth,
+        engine: options.engine ? String(options.engine).trim() : undefined,
+        model: options.model ? String(options.model).trim() : undefined,
+        effort: effort || weight,
+        nodeTarget: validateNodeTarget(options.nodes),
+        steering: options.steering ? String(options.steering) : undefined,
+      };
+
+      let schedule = createIdeasNightlySchedule({
+        id: options.id ? String(options.id) : undefined,
+        time: validateNightlyTime(options.time),
+        cwd: process.cwd(),
+        plan,
+      });
+
+      console.log(`  ✓ Saved nightly Possible schedule: ${schedule.id}`);
+      console.log(`  time: ${schedule.time} local`);
+      console.log(`  schedule: ${schedule.schedulePath}`);
+
+      if (options.launchd === false) {
+        console.log(`\n  Launch manually: ft possible nightly run-now ${schedule.id}`);
+        return;
+      }
+
+      if (process.platform !== 'darwin') {
+        console.log('\n  LaunchAgent install is macOS-only. The schedule was saved, but not installed.');
+        console.log(`  Launch manually: ft possible nightly run-now ${schedule.id}`);
+        return;
+      }
+
+      schedule = writeNightlyLaunchAgent({
+        schedule,
+        invocation: currentCliInvocation(),
+      });
+      console.log(`  launchd plist: ${schedule.launchAgent?.plistPath}`);
+
+      if (options.load === false) {
+        console.log(`\n  Load later: launchctl bootstrap gui/$(id -u) ${schedule.launchAgent?.plistPath}`);
+        return;
+      }
+
+      const loaded = loadNightlyLaunchAgent(schedule);
+      if (!loaded.result.ok) {
+        console.log('\n  LaunchAgent plist was written, but launchctl did not load it.');
+        console.log(`  ${loaded.result.command.join(' ')}`);
+        if (loaded.result.stderr.trim()) console.log(`  ${loaded.result.stderr.trim()}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log('  launchd loaded');
+      console.log(`\n  Check later: ft possible nightly show ${loaded.schedule.id}`);
+    }));
+
+  nightly
+    .command('list')
+    .description('List nightly Possible schedules')
+    .action(() => {
+      console.log(formatIdeasNightlyScheduleList(listIdeasNightlySchedules()));
+    });
+
+  nightly
+    .command('show')
+    .description('Show a nightly Possible schedule')
+    .argument('[id]', 'Schedule id', 'default')
+    .action(safe(async (id: string) => {
+      const schedule = readIdeasNightlySchedule(String(id));
+      if (!schedule) {
+        console.log(`  Nightly schedule not found: ${String(id)}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(formatIdeasNightlySchedule(schedule));
+    }));
+
+  nightly
+    .command('run-now')
+    .description('Start the configured nightly run immediately as a background job')
+    .argument('[id]', 'Schedule id', 'default')
+    .action(safe(async (id: string) => {
+      const job = runIdeasNightlyTick(String(id));
+      console.log(`  ✓ Nightly Possible job started: ${job.id}`);
+      console.log(`  Inspect: ft possible job ${job.id} --log`);
+    }));
+
+  nightly
+    .command('uninstall')
+    .description('Unload and delete a nightly Possible schedule')
+    .argument('[id]', 'Schedule id', 'default')
+    .option('--keep-schedule', 'Unload launchd but keep the saved schedule file', false)
+    .action(safe(async (id: string, options) => {
+      const schedule = readIdeasNightlySchedule(String(id));
+      if (!schedule) {
+        console.log(`  Nightly schedule not found: ${String(id)}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      if (process.platform === 'darwin' && schedule.launchAgent) {
+        unloadNightlyLaunchAgent(schedule);
+        fs.rmSync(schedule.launchAgent.plistPath, { force: true });
+        console.log(`  Removed LaunchAgent: ${schedule.launchAgent.plistPath}`);
+      }
+      if (!options.keepSchedule) {
+        deleteIdeasNightlySchedule(schedule.id);
+        console.log(`  Deleted nightly schedule: ${schedule.id}`);
+      }
+    }));
+
+  nightly
+    .command('_tick', { hidden: true })
+    .description('Internal launchd entrypoint for nightly Possible schedules')
+    .argument('<id>', 'Schedule id')
+    .action(safe(async (id: string) => {
+      const job = runIdeasNightlyTick(String(id));
+      console.log(`Started nightly Possible job: ${job.id}`);
+    }));
+
+  possible
+    .command('_run-job', { hidden: true })
+    .description('Internal worker for background possibility jobs')
+    .argument('<jobId>', 'Background job id')
+    .action(safe(async (jobId: string) => {
+      const job = await runIdeasJobWorker(String(jobId));
+      if (job.status === 'failed') process.exitCode = 1;
+    }));
+
+  possible
+    .command('list')
+    .description('List recent possibility runs')
+    .action(safe(async () => {
+      console.log(formatRunList(listIdeaRuns()));
+    }));
+
+  possible
+    .command('show')
+    .description('Show one possibility run in detail')
+    .argument('[runId]', 'Run id, or omit for latest', 'latest')
+    .action(safe(async (runId?: string) => {
+      const run = resolveIdeaRun(runId);
+      if (!run) {
+        console.log('  No possibility run found.');
+        process.exitCode = 1;
+        return;
+      }
+      console.log(formatRunSummary(run));
+    }));
+
+  possible
+    .command('grid')
+    .description('Render the 2x2 grid for a possibility run')
+    .argument('[runId]', 'Run id, or omit for latest', 'latest')
+    .action(safe(async (runId?: string) => {
+      console.log(renderRunGrid(runId));
+    }));
+
+  possible
+    .command('dots')
+    .description('Render all scored ideas for a run')
+    .argument('[runId]', 'Run id, or omit for latest', 'latest')
+    .action(safe(async (runId?: string) => {
+      console.log(renderRunDots(runId));
+    }));
+
+  possible
+    .command('prompt')
+    .description('Print the exportable prompt for a scored idea')
+    .argument('<dotId>', 'Dot artifact id')
+    .action(safe(async (dotId: string) => {
+      console.log(getIdeaPrompt(String(dotId)));
+    }));
+
+  const seeds = program
+    .command('seeds')
+    .description('Create, inspect, and manage reusable seed context for ideas runs');
+
+  seeds
+    .action(() => {
+      console.log('Seeds shape context. Use them to gather, save, and reuse source material before running ft possible.');
+      console.log('');
+      console.log('Useful commands:');
+      console.log('  ft seeds list');
+      console.log('  ft seeds create --artifact <id...>');
+      console.log('  ft seeds text "..."');
+      console.log('  ft possible run --seed <seed-id> --repo .');
+    });
+
+  seeds
+    .command('list')
+    .description('List saved seeds')
+    .action(safe(async () => {
+      console.log(formatIdeasSeedList(listIdeasSeeds()));
+    }));
+
+  seeds
+    .command('show')
+    .description('Show one saved seed')
+    .argument('<seedId>', 'Seed id')
+    .action(safe(async (seedId: string) => {
+      const seed = readIdeasSeed(String(seedId));
+      if (!seed) {
+        console.log(`  Seed not found: ${String(seedId)}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(formatIdeasSeed(seed));
+    }));
+
+  seeds
+    .command('create')
+    .description('Create a saved seed from one or more existing artifacts')
+    .requiredOption('--artifact <id...>', 'One or more artifact ids')
+    .option('--title <text>', 'Seed title')
+    .option('--notes <text>', 'Optional notes')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const seed = await createIdeasSeedFromArtifacts({
+        artifactIds: (options.artifact as string[]).map(String),
+        title: options.title ? String(options.title) : undefined,
+        notes: options.notes ? String(options.notes) : undefined,
+        frameId,
+      });
+      console.log(`  ✓ Created seed: ${seed.id}`);
+      console.log(`  Title: ${seed.title}`);
+      console.log(`  Artifacts: ${seed.artifactIds.join(', ')}`);
+      if (frameId) console.log(`  Frame: ${frameId}`);
+      console.log(`\n  Next:`);
+      console.log(`    ft ideas run --seed ${seed.id} --repo .`);
+    }));
+
+  seeds
+    .command('text')
+    .description('Create a saved seed from raw text')
+    .argument('<text>', 'Seed text')
+    .option('--title <text>', 'Seed title')
+    .option('--notes <text>', 'Optional notes')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (text: string, options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const seed = await createIdeasSeedFromText({
+        text: String(text),
+        title: options.title ? String(options.title) : undefined,
+        notes: options.notes ? String(options.notes) : undefined,
+        frameId,
+      });
+      console.log(`  ✓ Created seed: ${seed.id}`);
+      console.log(`  Title: ${seed.title}`);
+      if (frameId) console.log(`  Frame: ${frameId}`);
+      console.log(`\n  Next:`);
+      console.log(`    ft ideas run --seed ${seed.id} --repo .`);
+    }));
+
+  seeds
+    .command('delete')
+    .description('Delete a saved seed')
+    .argument('<seedId>', 'Seed id')
+    .action(safe(async (seedId: string) => {
+      const deleted = deleteIdeasSeed(String(seedId));
+      if (!deleted) {
+        console.log(`  Seed not found: ${String(seedId)}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`  Deleted seed: ${String(seedId)}`);
+    }));
+
+  seeds
+    .command('strategies')
+    .description('List available seed strategies')
+    .action(() => {
+      for (const strategy of SEED_STRATEGIES) {
+        const flair = strategy.playful ? ' playful' : ' standard';
+        console.log(`${strategy.id.padEnd(14)} ${flair}  ${strategy.summary}`);
+      }
+    });
+
+  seeds
+    .command('strategy')
+    .description('Inspect one seed strategy')
+    .argument('<name>', 'Strategy id')
+    .action((name: string) => {
+      const strategy = getSeedStrategy(String(name));
+      if (!strategy) {
+        console.log(`  Unknown strategy: ${String(name)}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`${strategy.label} (${strategy.id})`);
+      console.log(`${strategy.summary}`);
+      console.log(`Playful: ${strategy.playful ? 'yes' : 'no'}`);
+      console.log('');
+      console.log(`Example title:`);
+      console.log(`  ${strategy.buildTitle({ category: 'tool', days: 30 })}`);
+    });
+
+  seeds
+    .command('search')
+    .description('Preview or save a search-shaped seed from bookmarks')
+    .argument('<query>', 'Search query')
+    .option('--category <name>', 'Filter by category')
+    .option('--domain <name>', 'Filter by domain')
+    .option('--folder <name>', 'Filter by folder')
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--days <n>', 'Limit to the last N days', (v: string) => Number(v))
+    .option('--limit <n>', 'Max bookmarks to use', (v: string) => Number(v), 8)
+    .option('--create', 'Save the result as a seed', false)
+    .option('--title <text>', 'Seed title override')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (query: string, options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const spec = buildSeedStrategySpec({
+        strategy: 'search',
+        filters: {
+          query: String(query),
+          category: options.category ? String(options.category) : undefined,
+          domain: options.domain ? String(options.domain) : undefined,
+          folder: options.folder ? String(options.folder) : undefined,
+          author: options.author ? String(options.author) : undefined,
+          days: typeof options.days === 'number' ? options.days : undefined,
+          limit: Number(options.limit) || 8,
+        },
+      });
+      const candidates = await querySeedCandidates(spec.filters);
+      console.log(formatSeedCandidates(candidates));
+      if (options.create && candidates.length > 0) {
+        const seed = await saveSeedFromCandidates({
+          candidates,
+          title: options.title ? String(options.title) : summarizeSeedIntent('Search seed', spec.filters),
+          notes: `strategy=${spec.strategy}`,
+          strategy: spec.strategy,
+          strategyParams: spec.strategyParams,
+          frameId,
+        });
+        console.log(`\n  ✓ Created seed: ${seed.id}${frameId ? `  (frame: ${frameId})` : ''}`);
+      }
+    }));
+
+  seeds
+    .command('recent')
+    .description('Preview or save a recent seed from bookmarks')
+    .option('--category <name>', 'Filter by category')
+    .option('--domain <name>', 'Filter by domain')
+    .option('--folder <name>', 'Filter by folder')
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--days <n>', 'Limit to the last N days', (v: string) => Number(v), 30)
+    .option('--limit <n>', 'Max bookmarks to use', (v: string) => Number(v), 8)
+    .option('--create', 'Save the result as a seed', false)
+    .option('--title <text>', 'Seed title override')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const spec = buildSeedStrategySpec({
+        strategy: 'recent',
+        filters: {
+          category: options.category ? String(options.category) : undefined,
+          domain: options.domain ? String(options.domain) : undefined,
+          folder: options.folder ? String(options.folder) : undefined,
+          author: options.author ? String(options.author) : undefined,
+          days: typeof options.days === 'number' ? options.days : 30,
+          limit: Number(options.limit) || 8,
+        },
+      });
+      const candidates = await querySeedCandidates(spec.filters);
+      console.log(formatSeedCandidates(candidates));
+      if (options.create && candidates.length > 0) {
+        const seed = await saveSeedFromCandidates({
+          candidates,
+          title: options.title ? String(options.title) : summarizeSeedIntent('Recent seed', spec.filters),
+          notes: `strategy=${spec.strategy}`,
+          strategy: spec.strategy,
+          strategyParams: spec.strategyParams,
+          frameId,
+        });
+        console.log(`\n  ✓ Created seed: ${seed.id}${frameId ? `  (frame: ${frameId})` : ''}`);
+      }
+    }));
+
+  seeds
+    .command('random')
+    .description('Play a random prompt mini-game and shape a seed from it')
+    .option('--mode <kind>', 'Random mode: sample | model', 'sample')
+    .option('--category <name>', 'Filter by category')
+    .option('--domain <name>', 'Filter by domain')
+    .option('--folder <name>', 'Filter by folder')
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--days <n>', 'Limit to the last N days', (v: string) => Number(v))
+    .option('--limit <n>', 'Max bookmarks to use', (v: string) => Number(v), 5)
+    .option('--prompts <n>', 'Show N random word-pair prompts', (v: string) => Number(v), 6)
+    .option('--pick <text>', 'Chosen random prompt phrase')
+    .option('--suggest <n>', 'Number of model suggestions', (v: string) => Number(v), 3)
+    .option('--create', 'Save the result as a seed', false)
+    .option('--title <text>', 'Seed title override')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const prompts = generateRandomSeedPrompts(Number(options.prompts) || 6);
+      console.log('Mini-game prompts');
+      console.log('');
+      for (const [idx, prompt] of prompts.entries()) console.log(`${idx + 1}. ${prompt}`);
+      console.log('');
+      console.log('Choose one with:');
+      console.log('  ft seeds random --pick "<phrase>" --create');
+      console.log('');
+
+      const spec = buildSeedStrategySpec({
+        strategy: 'random',
+        filters: {
+          category: options.category ? String(options.category) : undefined,
+          domain: options.domain ? String(options.domain) : undefined,
+          folder: options.folder ? String(options.folder) : undefined,
+          author: options.author ? String(options.author) : undefined,
+          days: typeof options.days === 'number' ? options.days : undefined,
+          limit: Number(options.limit) || 5,
+        },
+        strategyParams: options.pick ? { pick: String(options.pick) } : undefined,
+      });
+
+      const mode = String(options.mode || 'sample');
+      if (mode === 'model' && options.pick) {
+        const candidates = await querySeedCandidates({ ...spec.filters, limit: Math.max((spec.filters.limit ?? 5) * 3, 15) });
+        if (candidates.length === 0) {
+          console.log('No candidate bookmarks found.');
+          return;
+        }
+
+        const result = await modelOrganizeSeeds({
+          filters: spec.filters,
+          candidates,
+          suggestCount: Number(options.suggest) || 3,
+          theme: String(options.pick),
+          onProgress: (message) => process.stderr.write(`  ${message}\n`),
+        });
+
+        console.log(`Picked prompt: ${String(options.pick)}`);
+        console.log('');
+        console.log('Plan');
+        console.log('');
+        console.log(result.explanation);
+        console.log('');
+        console.log('Suggestions');
+        console.log('');
+        for (const [idx, suggestion] of result.suggestions.entries()) {
+          console.log(`${idx + 1}. ${suggestion.title}  (${suggestion.itemIds.length})`);
+          console.log(`   ${suggestion.rationale}`);
+          console.log(`   ids: ${suggestion.itemIds.join(', ')}`);
+          console.log('');
+        }
+
+        if (options.create && result.suggestions.length > 0) {
+          console.log('Saved seeds');
+          console.log('');
+          for (const suggestion of result.suggestions) {
+            const seed = await createIdeasSeedFromArtifacts({
+              artifactIds: suggestion.itemIds,
+              title: options.title ? String(options.title) : suggestion.title,
+              notes: suggestion.rationale,
+              strategy: 'random-model',
+              strategyParams: {
+                pick: String(options.pick),
+                suggest: Number(options.suggest) || 3,
+              },
+              frameId,
+              createdBy: 'model',
+            });
+            console.log(`- ${seed.id}  ${seed.title}${frameId ? `  (frame: ${frameId})` : ''}`);
+          }
+          console.log('');
+        }
+        return;
+      }
+
+      const candidates = await queryRandomSeedCandidates(spec.filters);
+      if (options.pick) {
+        console.log(`Picked prompt: ${String(options.pick)}`);
+        console.log('');
+        console.log('The model/app can use this phrase to interpret the resulting seed grouping later.');
+        console.log('');
+      }
+      console.log(formatSeedCandidates(candidates));
+      if (options.create && candidates.length > 0) {
+        const seed = await saveSeedFromCandidates({
+          candidates,
+          title: options.title ? String(options.title) : (options.pick ? `Random seed — ${String(options.pick)}` : summarizeSeedIntent('Random seed', spec.filters)),
+          notes: `strategy=${spec.strategy}${options.pick ? ` pick=${String(options.pick)}` : ''}`,
+          strategy: spec.strategy,
+          strategyParams: spec.strategyParams,
+          frameId,
+        });
+        console.log(`\n  ✓ Created seed: ${seed.id}${frameId ? `  (frame: ${frameId})` : ''}`);
+      }
+    }));
+
+  seeds
+    .command('lucky')
+    .description('Preview or save a likely-interesting seed from a filtered pool')
+    .option('--query <text>', 'Optional query filter')
+    .option('--category <name>', 'Filter by category')
+    .option('--domain <name>', 'Filter by domain')
+    .option('--folder <name>', 'Filter by folder')
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--days <n>', 'Limit to the last N days', (v: string) => Number(v), 30)
+    .option('--limit <n>', 'Max bookmarks to use', (v: string) => Number(v), 5)
+    .option('--create', 'Save the result as a seed', false)
+    .option('--title <text>', 'Seed title override')
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seed')
+    .action(safe(async (options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const spec = buildSeedStrategySpec({
+        strategy: 'lucky',
+        filters: {
+          query: options.query ? String(options.query) : undefined,
+          category: options.category ? String(options.category) : undefined,
+          domain: options.domain ? String(options.domain) : undefined,
+          folder: options.folder ? String(options.folder) : undefined,
+          author: options.author ? String(options.author) : undefined,
+          days: typeof options.days === 'number' ? options.days : 30,
+          limit: Number(options.limit) || 5,
+        },
+      });
+      const candidates = await querySeedCandidates({ ...spec.filters, limit: Math.max((spec.filters.limit ?? 5) * 2, 8) });
+      const picked = candidates.slice(0, spec.filters.limit ?? 5);
+      console.log(formatSeedCandidates(picked));
+      if (options.create && picked.length > 0) {
+        const seed = await saveSeedFromCandidates({
+          candidates: picked,
+          title: options.title ? String(options.title) : summarizeSeedIntent('Lucky seed', spec.filters),
+          notes: `strategy=${spec.strategy}`,
+          strategy: spec.strategy,
+          strategyParams: spec.strategyParams,
+          frameId,
+        });
+        console.log(`\n  ✓ Created seed: ${seed.id}${frameId ? `  (frame: ${frameId})` : ''}`);
+      }
+    }));
+
+  seeds
+    .command('organize')
+    .description('Group bookmark candidates into reusable seed organizations')
+    .option('--by <mode>', 'Grouping mode: category | domain | folder | time')
+    .option('--mode <kind>', 'Organize mode: deterministic | model', 'deterministic')
+    .option('--suggest <n>', 'Number of model suggestions', (v: string) => Number(v), 3)
+    .option('--save', 'Save model suggestions as seeds', false)
+    .option('--query <text>', 'Optional query filter')
+    .option('--category <name>', 'Filter by category')
+    .option('--domain <name>', 'Filter by domain')
+    .option('--folder <name>', 'Filter by folder')
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--days <n>', 'Limit to the last N days', (v: string) => Number(v))
+    .option('--limit <n>', 'Max bookmarks to scan', (v: string) => Number(v), 60)
+    .option('--frame <id>', 'Pin a 2x2 frame on the saved seeds')
+    .action(safe(async (options) => {
+      const frameId = validateOptionalFrameId(options.frame);
+      const filters = {
+        query: options.query ? String(options.query) : undefined,
+        category: options.category ? String(options.category) : undefined,
+        domain: options.domain ? String(options.domain) : undefined,
+        folder: options.folder ? String(options.folder) : undefined,
+        author: options.author ? String(options.author) : undefined,
+        days: typeof options.days === 'number' ? options.days : undefined,
+        limit: Number(options.limit) || 60,
+      };
+
+      if (String(options.mode) === 'model') {
+        const candidates = await querySeedCandidates(filters);
+        if (candidates.length === 0) {
+          console.log('No candidate bookmarks found.');
+          return;
+        }
+
+        const result = await modelOrganizeSeeds({
+          filters,
+          candidates,
+          suggestCount: Number(options.suggest) || 3,
+          onProgress: (message) => process.stderr.write(`  ${message}\n`),
+        });
+
+        console.log('Plan');
+        console.log('');
+        console.log(result.explanation);
+        console.log('');
+        console.log('Suggestions');
+        console.log('');
+        for (const [idx, suggestion] of result.suggestions.entries()) {
+          console.log(`${idx + 1}. ${suggestion.title}  (${suggestion.itemIds.length})`);
+          console.log(`   ${suggestion.rationale}`);
+          console.log(`   ids: ${suggestion.itemIds.join(', ')}`);
+          console.log('');
+        }
+
+        if (options.save && result.suggestions.length > 0) {
+          console.log('Saved seeds');
+          console.log('');
+          for (const suggestion of result.suggestions) {
+            const seed = await createIdeasSeedFromArtifacts({
+              artifactIds: suggestion.itemIds,
+              title: suggestion.title,
+              notes: suggestion.rationale,
+              strategy: 'model-organize',
+              strategyParams: {
+                suggest: Number(options.suggest) || 3,
+              },
+              frameId,
+              createdBy: 'model',
+            });
+            console.log(`- ${seed.id}  ${seed.title}${frameId ? `  (frame: ${frameId})` : ''}`);
+          }
+          console.log('');
+        }
+        return;
+      }
+
+      const mode = String(options.by || '') as 'category' | 'domain' | 'folder' | 'time';
+      if (!['category', 'domain', 'folder', 'time'].includes(mode)) {
+        console.log('  Deterministic organize mode requires --by category|domain|folder|time');
+        process.exitCode = 1;
+        return;
+      }
+
+      const result = await organizeSeedCandidatesBy(mode, filters);
+      console.log(formatSeedOrganization(result));
+    }));
+
+  const possibleSeed = possible
+    .command('seed')
+    .description('(alias) Seed commands live under `ft seeds`');
+
+  for (const cmd of ['list', 'show', 'create', 'text', 'delete']) {
+    possibleSeed.command(cmd).description(`Alias for: ft seeds ${cmd}`).allowUnknownOption(true)
+      .action(async () => {
+        const args = ['node', 'ft', 'seeds', cmd, ...process.argv.slice(4)];
+        await program.parseAsync(args);
+      });
+  }
+
+  // ── repos ──────────────────────────────────────────────────────────────
+
+  const repos = program
+    .command('repos')
+    .description('Save and manage the default repo set used by `ft ideas run`');
+
+  repos.action(() => {
+    const saved = listSavedRepos();
+    if (saved.length === 0) {
+      console.log('No saved repos. Add one with: ft repos add <path>');
+    } else {
+      console.log(`Saved repos (${saved.length}):`);
+      for (const r of saved) console.log(`  ${r}`);
+    }
+  });
+
+  repos
+    .command('list')
+    .description('List saved repo paths')
+    .action(safe(async () => {
+      const saved = listSavedRepos();
+      if (saved.length === 0) {
+        console.log('No saved repos. Add one with: ft repos add <path>');
+        return;
+      }
+      for (const r of saved) console.log(r);
+    }));
+
+  repos
+    .command('add')
+    .description('Add a repo path to the default set')
+    .argument('<path>', 'Repo path (absolute, ~, or relative)')
+    .action(safe(async (repoPath: string) => {
+      const result = addRepoToRegistry(String(repoPath));
+      if (result.added) {
+        console.log(`  ✓ Added: ${result.canonical}`);
+      } else {
+        console.log(`  Already saved: ${result.canonical}`);
+      }
+    }));
+
+  repos
+    .command('remove')
+    .description('Remove a repo path from the default set')
+    .argument('<path>', 'Repo path to remove')
+    .action(safe(async (repoPath: string) => {
+      const result = removeRepoFromRegistry(String(repoPath));
+      if (result.removed) {
+        console.log(`  ✓ Removed: ${result.canonical}`);
+      } else {
+        console.log(`  Not in registry: ${result.canonical}`);
+        process.exitCode = 1;
+      }
+    }));
+
+  repos
+    .command('clear')
+    .description('Remove all saved repo paths')
+    .action(safe(async () => {
+      const count = clearReposRegistry();
+      console.log(`  ✓ Cleared ${count} saved repo${count === 1 ? '' : 's'}.`);
+    }));
+
+  // ── frames ─────────────────────────────────────────────────────────────
+
+  const frames = program
+    .command('frames')
+    .description('List built-in and user-defined 2x2 frames');
+
+  frames.action(() => {
+    const all = listAllFrames();
+    const userIds = new Set(loadUserFrames().map((f) => f.id));
+    console.log(`Frames (${all.length} total: ${all.length - userIds.size} built-in, ${userIds.size} user):`);
+    for (const f of all) {
+      const origin = userIds.has(f.id) ? 'user' : 'built-in';
+      console.log(`  ${f.id.padEnd(28)} ${f.group.padEnd(9)} ${origin.padEnd(9)} ${f.name}`);
+    }
+  });
+
+  frames
+    .command('list')
+    .description('List every available frame (built-in + user)')
+    .action(safe(async () => {
+      const all = listAllFrames();
+      const userIds = new Set(loadUserFrames().map((f) => f.id));
+      for (const f of all) {
+        const origin = userIds.has(f.id) ? 'user' : 'built-in';
+        console.log(`${f.id}  ${f.group}  ${origin}  ${f.name}`);
+      }
+    }));
+
+  frames
+    .command('show')
+    .description('Show one frame in detail')
+    .argument('<id>', 'Frame id (built-in or user)')
+    .action(safe(async (id: string) => {
+      const frame = getFrame(String(id));
+      if (!frame) {
+        const known = listAllFrames().map((f) => f.id).join(', ');
+        console.log(`  Unknown frame: ${String(id)}`);
+        console.log(`  Available: ${known}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`${frame.name} (${frame.id})`);
+      console.log(`  group: ${frame.group}`);
+      console.log(`  axis A: ${frame.axisA.label}`);
+      console.log(`    ${frame.axisA.rubricSentence}`);
+      console.log(`  axis B: ${frame.axisB.label}`);
+      console.log(`    ${frame.axisB.rubricSentence}`);
+      console.log(`  quadrants:`);
+      console.log(`    high A × high B: ${frame.quadrantLabels.highHigh}`);
+      console.log(`    high A × low  B: ${frame.quadrantLabels.highLow}`);
+      console.log(`    low  A × high B: ${frame.quadrantLabels.lowHigh}`);
+      console.log(`    low  A × low  B: ${frame.quadrantLabels.lowLow}`);
+      console.log(`  generation addition:`);
+      console.log(`    ${frame.generationPromptAddition}`);
+    }));
+
+  frames
+    .command('add')
+    .description('Add a user-defined frame from a JSON file')
+    .argument('<file>', 'Path to a JSON file describing the frame')
+    .action(safe(async (file: string) => {
+      const result = addUserFrameFromFile(String(file));
+      const verb = result.replacedExisting ? 'Updated' : 'Added';
+      console.log(`  ✓ ${verb} user frame: ${result.frame.id}`);
+      console.log(`  ${result.frame.name} (${result.frame.group})`);
+      console.log(`\n  Next:`);
+      console.log(`    ft frames show ${result.frame.id}`);
+      console.log(`    ft ideas run --seed <seed-id> --repo . --frame ${result.frame.id}`);
+    }));
+
+  frames
+    .command('remove')
+    .description('Remove a user-defined frame (built-ins cannot be removed)')
+    .argument('<id>', 'Frame id')
+    .action(safe(async (id: string) => {
+      const removed = removeUserFrame(String(id));
+      if (!removed) {
+        console.log(`  Not a user frame: ${String(id)}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`  ✓ Removed user frame: ${String(id)}`);
+    }));
+
   // ── skill ──────────────────────────────────────────────────────────────
 
   const skill = program
@@ -1613,6 +2843,9 @@ export function buildCli() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const program = buildCli();
-  program.hook('postAction', async () => { await checkForUpdate(); });
+  program.hook('postAction', async (_thisCommand, actionCommand) => {
+    if (shouldSkipCommandChrome(actionCommand)) return;
+    await checkForUpdate();
+  });
   await program.parseAsync(process.argv);
 }

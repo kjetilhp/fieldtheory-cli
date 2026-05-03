@@ -15,12 +15,31 @@ import { PromptCancelledError, promptText } from './prompt.js';
 
 export interface EngineConfig {
   bin: string;
-  args: (prompt: string) => string[];
+  args: (prompt: string, engine?: Pick<ResolvedEngine, 'model' | 'effort'>) => string[];
 }
 
 const KNOWN_ENGINES: Record<string, EngineConfig> = {
-  claude: { bin: 'claude', args: (p) => ['-p', '--output-format', 'text', p] },
-  codex:  { bin: 'codex',  args: (p) => ['exec', '--skip-git-repo-check', p] },
+  claude: {
+    bin: 'claude',
+    args: (p, engine) => [
+      '-p',
+      '--output-format',
+      'text',
+      ...(engine?.model ? ['--model', engine.model] : []),
+      ...(engine?.effort ? ['--effort', engine.effort] : []),
+      p,
+    ],
+  },
+  codex: {
+    bin: 'codex',
+    args: (p, engine) => [
+      'exec',
+      '--skip-git-repo-check',
+      ...(engine?.model ? ['--model', engine.model] : []),
+      ...(engine?.effort ? ['--config', `model_reasoning_effort="${engine.effort}"`] : []),
+      p,
+    ],
+  },
 };
 
 /** Order used when auto-detecting. */
@@ -90,18 +109,55 @@ async function askYesNo(question: string): Promise<boolean> {
 export interface ResolvedEngine {
   name: string;
   config: EngineConfig;
+  model?: string;
+  effort?: string;
+  label: string;
 }
 
-function resolve(name: string): ResolvedEngine {
-  return { name, config: KNOWN_ENGINES[name] };
+export interface EngineRunProfile {
+  engine?: string;
+  override?: string;
+  model?: string;
+  effort?: string;
+}
+
+function cleanOptional(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function formatEngineLabel(input: { name: string; model?: string; effort?: string }): string {
+  const model = cleanOptional(input.model);
+  const effort = cleanOptional(input.effort);
+  return [
+    input.name,
+    ...(model ? [model] : []),
+    ...(effort ? [`effort=${effort}`] : []),
+  ].join('/');
+}
+
+export function describeEngine(engine: Pick<ResolvedEngine, 'name' | 'model' | 'effort'>): string {
+  return formatEngineLabel(engine);
+}
+
+function resolve(name: string, profile: EngineRunProfile = {}): ResolvedEngine {
+  const model = cleanOptional(profile.model);
+  const effort = cleanOptional(profile.effort);
+  return {
+    name,
+    config: KNOWN_ENGINES[name],
+    model,
+    effort,
+    label: formatEngineLabel({ name, model, effort }),
+  };
 }
 
 /**
  * Resolve which engine to use for classification.
  *
- * If `options.override` is set, require that specific engine: fails fast
- * if it's unknown or not on PATH. Saved preferences and prompting are
- * bypassed — this is meant for per-invocation overrides like `--engine`.
+ * If `profile.override` or `profile.engine` is set, require that specific
+ * engine: fails fast if it's unknown or not on PATH. Saved preferences and
+ * prompting are bypassed.
  *
  * Otherwise:
  * 1. If a saved default exists and is available, use it silently.
@@ -112,24 +168,25 @@ function resolve(name: string): ResolvedEngine {
  *
  * Throws if no engine is found.
  */
-export async function resolveEngine(options: { override?: string } = {}): Promise<ResolvedEngine> {
-  if (options.override) {
-    const name = options.override;
-    if (!Object.hasOwn(KNOWN_ENGINES, name)) {
+export async function resolveEngine(profile: EngineRunProfile = {}): Promise<ResolvedEngine> {
+  const requestedEngine = cleanOptional(profile.engine ?? profile.override);
+
+  if (requestedEngine) {
+    if (!Object.hasOwn(KNOWN_ENGINES, requestedEngine)) {
       const known = Object.keys(KNOWN_ENGINES).join(', ');
-      throw new Error(`Unknown engine "${name}". Known engines: ${known}.`);
+      throw new Error(`Unknown engine "${requestedEngine}". Known engines: ${known}.`);
     }
-    if (!hasCommandOnPath(KNOWN_ENGINES[name].bin)) {
+    if (!hasCommandOnPath(KNOWN_ENGINES[requestedEngine].bin)) {
       const available = detectAvailableEngines();
       const hint = available.length > 0
         ? ` Available on PATH: ${available.join(', ')}.`
         : '';
       throw new Error(
-        `Engine "${name}" is not on PATH.${hint}\n` +
+        `Engine "${requestedEngine}" is not on PATH.${hint}\n` +
         `Install it and log in, or pick a different engine.`
       );
     }
-    return resolve(name);
+    return resolve(requestedEngine, profile);
   }
 
   const available = detectAvailableEngines();
@@ -146,17 +203,17 @@ export async function resolveEngine(options: { override?: string } = {}): Promis
   // Check saved preference
   const prefs = loadPreferences();
   if (prefs.defaultEngine && available.includes(prefs.defaultEngine)) {
-    return resolve(prefs.defaultEngine);
+    return resolve(prefs.defaultEngine, profile);
   }
 
   // Single engine — just use it
   if (available.length === 1) {
-    return resolve(available[0]);
+    return resolve(available[0], profile);
   }
 
   // Multiple engines — prompt if TTY, else use first
   if (!process.stdin.isTTY) {
-    return resolve(available[0]);
+    return resolve(available[0], profile);
   }
 
   for (const name of available) {
@@ -164,13 +221,13 @@ export async function resolveEngine(options: { override?: string } = {}): Promis
     if (yes) {
       savePreferences({ ...prefs, defaultEngine: name });
       process.stderr.write(`  \u2713 ${name} set as default (change anytime: ft model)\n`);
-      return resolve(name);
+      return resolve(name, profile);
     }
   }
 
   // Said no to everything — use first anyway but don't persist
   process.stderr.write(`  Using ${available[0]} (no default saved)\n`);
-  return resolve(available[0]);
+  return resolve(available[0], profile);
 }
 
 // ── Invocation ─────────────────────────────────────────────────────────
@@ -272,8 +329,10 @@ function buildMessage(
   const stderrSnippet = stderr.trim().slice(-500);
   const detail = stderrSnippet ? ` \u2014 ${stderrSnippet}` : '';
   switch (reason) {
-    case 'timeout':
-      return `${engineName} timed out after ${Math.round(timeoutMs / 1000)}s${detail}`;
+    case 'timeout': {
+      const duration = timeoutMs < 1000 ? `${timeoutMs}ms` : `${Math.round(timeoutMs / 1000)}s`;
+      return `${engineName} timed out after ${duration}${detail}`;
+    }
     case 'maxbuffer':
       return `${engineName} output exceeded buffer cap${detail}`;
     case 'spawn':
@@ -302,7 +361,7 @@ export function invokeEngine(engine: ResolvedEngine, prompt: string, opts: Invok
   const timeout   = opts.timeout   ?? DEFAULT_TIMEOUT;
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAXBUF;
 
-  const result = spawnSync(bin, args(prompt), {
+  const result = spawnSync(bin, args(prompt, engine), {
     input: '',              // EOF on stdin — do not inherit parent stdin
     timeout,
     maxBuffer,
@@ -370,7 +429,7 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAXBUF;
 
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args(prompt), {
+    const child = spawn(bin, args(prompt, engine), {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
